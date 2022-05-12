@@ -1,0 +1,474 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(spatialLIBD)
+library(scuttle)
+library(dplyr)
+library(ggcorrplot)
+library(ggplot2)
+library(EBImage)
+library(ggpubr)
+```
+```{r}
+library(foreach)
+library(doParallel)
+registerDoParallel(8)
+```
+
+### Get Histology Image and Plot
+```{r}
+# get histology image
+img <- SpatialExperiment::imgRaster(spe_sub)
+
+## Transform to a rasterGrob object
+grob <- grid::rasterGrob(img, width = grid::unit(1, "npc"), height = grid::unit(1, "npc"))
+
+## Make a plot using geom_spatial
+p <- ggplot2::ggplot(
+    sample_df,
+    ggplot2::aes(
+        x = pxl_col_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
+        y = pxl_row_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
+    )
+) +
+    geom_spatial(
+        data = tibble::tibble(grob = list(grob)),
+        ggplot2::aes(grob = grob),
+        x = 0.5,
+        y = 0.5
+    )
+
+## Show the plot
+print(p)
+```
+
+```{r}
+png_link <- imgData(spe)[imgData(spe)$sample_id == sample_id,]$data[1]
+img <- readImage('https://spatial-dlpfc.s3.us-east-2.amazonaws.com/images/151507_tissue_lowres_image.png')
+```
+
+```{r}
+red <- imageData(EBImage::channel(img, 'red'))
+green <- imageData(EBImage::channel(img, 'green'))
+blue <- imageData(EBImage::channel(img, 'blue'))
+grey <- imageData(EBImage::channel(img, 'grey'))
+hist(red)
+hist(green)
+hist(blue)
+hist(grey)
+```
+```{r}
+display(red)
+display(green)
+display(blue)
+```
+
+```{r}
+# create boolean array for logcounts
+logcounts_151507 <- logcounts(spe_sub)
+
+# transpose logcounts matrix
+logcounts_151507 <- t(logcounts_151507)
+
+# remove columns with 0 max gene expression vals across all barcodes
+zv <- apply(logcounts_151507, 2, function(x) length(unique(x)) == 1)
+logcounts_151507_filtered <- as.matrix(logcounts_151507[,!zv])
+
+dim(logcounts_151507)
+dim(logcounts_151507_filtered)
+```
+
+### Create DF Holding Pixel locations and Pixel Color Channel Values
+```{r}
+# get scale factor
+scaling <- SpatialExperiment::scaleFactors(spe_sub)
+
+# get names of barcodes in sample, filter pxl dataframe to only include those barcodes
+spatial_coords <- spatialCoords(spe_sub)
+
+# create data frame
+data <- data.frame(spatial_coords, row.names=NULL)
+data['barcode'] <- rownames(spatial_coords)
+
+# add scaled pixel columns
+new <- ceiling(data[["pxl_col_in_fullres"]] * scaling)
+data[ , ncol(data) + 1] <- new 
+colnames(data)[ncol(data)] <- "scaled_pxl_col_in_lowres"
+
+# add scaled pixel rows
+new <- ceiling(data[["pxl_row_in_fullres"]] * scaling)
+data[ , ncol(data) + 1] <- new 
+colnames(data)[ncol(data)] <- "scaled_pxl_row_in_lowres"
+```
+
+```{r}
+# create vectors to be added to dataframe
+X_r <- vector(mode="double", length = dim(data)[1])
+X_g <- vector(mode="double", length = dim(data)[1])
+X_b <- vector(mode="double", length = dim(data)[1])
+X_grey <- vector(mode="double", length = dim(data)[1])
+
+# iterate over dataframe, add rgb values
+for (i in 1:nrow(data)) {
+    col_index <- data[i,]$scaled_pxl_col_in_lowres
+    row_index <- data[i,]$scaled_pxl_row_in_lowres
+    X_r[i] <- red[col_index, row_index]
+    X_g[i] <- green[col_index, row_index]
+    X_b[i] <- blue[col_index, row_index]
+    X_grey[i] <- grey[col_index, row_index]
+}
+
+data[ , ncol(data) + 1] <- X_r
+colnames(data)[ncol(data)] <- "red"
+data[ , ncol(data) + 1] <- X_g
+colnames(data)[ncol(data)] <- "green"
+data[ , ncol(data) + 1] <- X_b
+colnames(data)[ncol(data)] <- "blue"
+data[ , ncol(data) + 1] <- X_grey
+colnames(data)[ncol(data)] <- "grey"
+```
+
+```{r}
+dim(data)
+data
+```
+
+
+### Create ind_barcodes DF only if each spot has multiple pixels associated so that mean/median/modecan be computed (For HighRes Images)
+```{r}
+# Mode Function
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# 
+populate_ind_barcodes <- function(i, ind_barcodes) {
+  colors <- c("red", "green", "blue", "grey")
+  for (j in 1:length(colors)) {
+    color <- colors[j]
+    vals <- data[data$barcode == row.names(ind_barcodes)[i],][,color]
+    ind_barcodes[i, paste("mean_", color, sep="")] <- mean(vals)
+    ind_barcodes[i, paste("median_", color, sep="")] <- median(vals)
+    ind_barcodes[i, paste("mode_", color, sep="")] <- getmode(vals) 
+  }
+  ind_barcodes
+}
+```
+
+
+```{r}
+# create empty df
+ind_barcodes <- data.frame(matrix(ncol = 12, nrow = length(unique(data[,'barcode']))))
+colnames(ind_barcodes) <- c('mean_red', 'median_red', 'mode_red', 'mean_green', 'median_green', 'mode_green', 'mean_blue', 'median_blue', 'mode_blue', 'mean_grey', 'median_grey', 'mode_grey')
+rownames(ind_barcodes) <- unique(data[, 'barcode'])
+
+# add mean, median, mode data
+for (i in 1:nrow(ind_barcodes)) {
+  ind_barcodes <- populate_ind_barcodes(i, ind_barcodes)
+}
+ind_barcodes
+```
+
+### Plot Histogram of Color Channel Values at a given barcode
+```{r}
+# histogram of color channel values in one spot
+barcode = rownames(ind_barcodes)[1]
+x <- data[data$barcode == barcode,'green']
+hist(x, main="Histogram of Green Color Channel Values For a Single Barcode",breaks=100)
+```
+
+### Function to Compute Corr Matrix in Parallel
+```{r}
+compute_corr_matrix <- function(expression_arr, color_arr) {
+  foreach(i = 1:ncol(expression_arr),
+  .combine = rbind,
+  .packages = c('data.table', 'doParallel')) %dopar% {
+    colName <- colnames(expression_arr)[i]
+    df <- data.frame(round(cor(expression_arr[,i], color_arr, method = 'pearson', use="complete.obs"), 3))
+    rownames(df) <- colName
+    df
+  }
+}
+```
+
+### Analysis 1: Compute Correlation First, Compute Outliers After
+In the following blocks, the correlation of between all genes + pixel color channel values is calculated. Then, for the top performing genes, a plotting function is called in which spots corresponding to outlier gene expression values + spots corresponding to outlier pixel color channel values are removed.
+
+```{r}
+# uncomment this line if each spot has one pixel
+color_arr <- data[,6:ncol(data)]
+
+# uncomment this line if each spot has multiple pixels
+# color_arr <- ind_barcodes
+correlation_matrix <- compute_corr_matrix(logcounts_151507_filtered, color_arr)
+```
+
+```{r}
+# set threshold and filter
+threshold <- 0.3
+correlation_matrix_filter <- correlation_matrix
+filter <- as.data.frame(apply(abs(correlation_matrix_filter) >= threshold, 1, any))
+correlation_matrix_filter <- correlation_matrix_filter[filter[,1],]
+
+# rename rownames based on gene name instead of gene ID
+for (i in 1:nrow(correlation_matrix_filter)) {
+  g_name <- rownames(correlation_matrix_filter)[i]
+  rownames(correlation_matrix_filter)[i] <- rowData(spe[g_name])$gene_name
+}
+correlation_matrix_filter
+```
+
+```{r}
+# plot  correlation matrix
+ggcorrplot(correlation_matrix_filter, sig.level=0.01, lab_size = 4.5, p.mat = NULL,
+           insig = c("pch", "blank"), pch = 1, pch.col = "black", pch.cex =1,
+           tl.cex = 7) +
+  theme(axis.text.x = element_text(margin=margin(-2,0,0,0)),
+        axis.text.y = element_text(margin=margin(0,-2,0,0)),
+        panel.grid.minor = element_line(size=7)) + 
+  geom_tile(fill="white") +
+  geom_tile(height=1, width=1)
+```
+
+
+```{r}
+# function to calculate regression equation. Used as a sanity check
+lm_eqn <- function(df){
+    m <- lm(mean_red ~ MTRNR2L8, df);
+    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(r)^2~"="~r2, 
+         list(a = format(unname(coef(m)[1]), digits = 2),
+              b = format(unname(coef(m)[2]), digits = 2),
+             r2 = format(summary(m)$r.squared, digits = 3)))
+    as.character(as.expression(eq));
+}
+
+# plot color channel value vs gene expression. If remove_outliers == TRUE, outlier gene expression values + outlier pixel color values are removed.
+# ASSUMES THAT EACH BARCODE HAS MULTIPLE PIXELS
+plot_channel_highres <- function(g_name, gene_id, color, stat, log_arr, color_arr, remove_outliers) {
+  stat_type <- paste(color, stat, sep="_")
+  x_axis <- log_arr[,gene_id]
+  y_axis <- color_arr[,stat_type] * 255
+  df <- data.frame(x_axis, y_axis)
+  if (remove_outliers) {
+    barcode_names <- rownames(log_arr)
+    overlap <- union(rownames(log_arr)[isOutlier(log_arr[,gene_id])], rownames(color_arr)[isOutlier(color_arr[,stat_type])])
+    rownames(df) <- barcode_names
+    df <- df[-which(rownames(df) %in% overlap),]
+    title <- paste(stat_type, " Channel Values vs ", g_name, " Gene Expression with Outliers Removed", sep="")
+  } else {
+    title <- paste(stat_type, " Channel Values vs ", g_name, " Gene Expression without Outliers Removed", sep="")
+  }
+  ggplot(df, aes(x=df[,1], y=df[,2])) + xlab(g_name) + ylab(stat_type) + geom_point(color=color) +
+  geom_smooth(method='lm', color='black') + stat_regline_equation(label.y = 190, aes(label = ..eq.label..)) +
+  stat_regline_equation(label.y = 180, aes(label = ..rr.label..)) + ggtitle(title) 
+}
+
+# call plot_channel function for all color and mean/median/mode combinations
+# ASSUMES THAT EACH BARCODE HAS MULTIPLE PIXELS
+plot_all_channels_highres <- function(g_name, log_arr, color_arr, remove_outliers) {
+  gene_id <- rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+  colors <- c('red', 'green', 'blue', 'grey')
+  stats <- c('mean', 'median', 'mode')
+
+  for (color in colors) {
+    for (stat in stats) {
+      print(plot_channel_highres(g_name, gene_id, color, stat, log_arr, color_arr, remove_outliers)) 
+    }
+  }
+}
+
+# plot color channel value vs gene expression. If remove_outliers == TRUE, outlier gene expression values + outlier pixel color values are removed.
+# ASSUMES THAT EACH BARCODE HAS ONE PIXEL
+plot_channel <- function(g_name, gene_id, color, log_arr, color_arr, remove_outliers) {
+  x_axis <- log_arr[,gene_id]
+  y_axis <- color_arr[,color] * 255
+  df <- data.frame(x_axis, y_axis)
+  if (remove_outliers) {
+    barcode_names <- rownames(log_arr)
+    overlap <- union(rownames(log_arr)[isOutlier(log_arr[,gene_id])], rownames(color_arr)[isOutlier(color_arr[,color])])
+    rownames(df) <- barcode_names
+    df <- df[-which(rownames(df) %in% overlap),]
+    title <- paste(color, " Channel Values vs ", g_name, " Gene Expression with Outliers Removed", sep="")
+  } else {
+    title <- paste(color, " Channel Values vs ", g_name, " Gene Expression without Outliers Removed", sep="")
+  }
+  ggplot(df, aes(x=df[,1], y=df[,2])) + xlab(g_name) + ylab(color) + geom_point(color=color) +
+  geom_smooth(method='lm', color='black') + stat_regline_equation(label.y = 190, aes(label = ..eq.label..)) +
+  stat_regline_equation(label.y = 180, aes(label = ..rr.label..)) + ggtitle(title) 
+}
+
+# call plot_channel function for all colors
+# ASSUMES THAT EACH BARCODE HAS ONE PIXEL
+plot_all_channels <- function(g_name, log_arr, color_arr, remove_outliers) {
+  gene_id <- rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+  colors <- c('red', 'green', 'blue', 'grey')
+
+  for (color in colors) {
+    print(plot_channel(g_name, gene_id, color, log_arr, color_arr, remove_outliers))
+  }
+}
+```
+
+```{r}
+plot_all_channels('MT-ND1', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
+plot_all_channels('MT-ND1', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
+```
+
+```{r}
+plot_all_channels('MT-CO2', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
+plot_all_channels('MT-CO2', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
+```
+```{r}
+plot_all_channels('MT-ATP6', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
+plot_all_channels('MT-ATP6', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
+```
+```{r}
+plot_all_channels('MT-CYB', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
+plot_all_channels('MT-CYB', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
+```
+
+
+## Redo Analysis Removing Outliers Before Correlation Computation
+
+```{r}
+# Remove outlier gene expression values. If median gene expression value is 0, replace complement of outliers with NA. Else replace outliers with NA. If remaining non-NA expression values < num, replace entire column with NA.
+remove_outliers <- function(arr, num) {
+  foreach(i = 1:ncol(arr),
+  .combine = cbind,
+  .packages = c('data.table', 'doParallel')) %dopar% {
+    if (median(arr[,i]) == 0) {
+      arr[,i][!isOutlier(arr[,i])] <- NA
+    } else {
+      arr[,i][isOutlier(arr[,i])] <- NA
+    }
+    if (matrixStats::count(!is.na(arr[,i])) < num) {
+      arr[,i] <- rep(NA, nrow(arr))
+    }
+    arr[,i]
+  }
+}
+
+```
+
+```{r}
+# Call remove outlier function
+logcounts_temp <- as.matrix(logcounts_151507_filtered)
+col_names <- colnames(logcounts_temp)
+logcounts_151507_filtered_no_outliers <- remove_outliers(logcounts_temp, 100)
+colnames(logcounts_151507_filtered_no_outliers) <- col_names
+logcounts_151507_filtered_no_outliers
+```
+
+```{r}
+# Remove columns that are completely NA
+not_all_na <- function(x) any(!is.na(x))
+logcounts_151507_filtered_no_outliers <- data.frame(logcounts_151507_filtered_no_outliers) %>% select(where(not_all_na))
+```
+
+```{r}
+dim(logcounts_151507_filtered_no_outliers)
+```
+
+```{r}
+# compute correlation matrix
+mat <- compute_corr_matrix(logcounts_151507_filtered_no_outliers, color_arr)
+```
+
+
+```{r}
+# filter corr matrix based on threshold
+threshold <- 0.35
+correlation_matrix_filter <- mat
+filter <- as.data.frame(apply(abs(correlation_matrix_filter) >= threshold, 1, any))
+correlation_matrix_filter <- na.omit(correlation_matrix_filter[filter[,1],])
+correlation_matrix_filter
+```
+
+```{r}
+# rename rows of correlation matrix with gene name
+for (i in 1:nrow(correlation_matrix_filter)) {
+  g_name <- rownames(correlation_matrix_filter)[i]
+  print(g_name)
+  rownames(correlation_matrix_filter)[i] <- rowData(spe[g_name])$gene_name
+}
+correlation_matrix_filter
+```
+
+```{r}
+# Correlation plot visualization
+ggcorrplot(correlation_matrix_filter, sig.level=0.01, lab_size = 4.5, p.mat = NULL,
+           insig = c("pch", "blank"), pch = 1, pch.col = "black", pch.cex =1,
+           tl.cex = 7) +
+  theme(axis.text.x = element_text(margin=margin(-2,0,0,0)),
+        axis.text.y = element_text(margin=margin(0,-2,0,0)),
+        panel.grid.minor = element_line(size=7)) + 
+  geom_tile(fill="white") +
+  geom_tile(height=1, width=1)
+```
+```{r}
+plot_all_channels('MARC1', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('HSD17B6', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('MSX1', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('MT-CO2', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('PLIN4', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('CIDEC', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+```{r}
+plot_all_channels('ELK4', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+
+
+```{r}
+plot_all_channels('LFNG', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
+```
+```{r}
+dim(logcounts_temp)
+dim(logcounts_151507_filtered_no_outliers)
+```
+
+
+### Find Location of Outliers on Histology Image
+```{r}
+# plot_outliers_in_lowres <- function(g_name, stat_type) {
+#   overlap <- union(rownames(max_ex_corr)[isOutlier(max_ex_corr[,g_name])], rownames(ind_barcodes)[isOutlier(ind_barcodes[,stat_type])])
+#   x_axis <- data[which(data$barcode %in% overlap),]$scaled_pxl_col_in_lowres
+#   y_axis <- data[which(data$barcode %in% overlap),]$scaled_pxl_row_in_lowres
+#   
+#   ggplot(data.frame(x_axis, y_axis), aes(x=x_axis, y=y_axis)) + xlab('Scaled Pixel Column in LowRes') + ylab('Scaled Pixel Row in LowRes') + geom_point(color='navy') +
+#     ggtitle(paste('Location of',stat_type, g_name, "Outliers on LowRes Image", sep=" ")) 
+# }
+# ```
+# 
+# 
+# ```{r}
+# plot_outliers_in_lowres('MT3', 'mean_red')
+# plot_outliers_in_lowres('MT3', 'mean_blue')
+# plot_outliers_in_lowres('MT3', 'mean_green')
+# ```
+# 
+# ```{r}
+# plot_outliers_in_lowres('MTRNR2L8', 'mean_red')
+# plot_outliers_in_lowres('MTRNR2L8', 'mean_blue')
+# plot_outliers_in_lowres('MTRNR2L8', 'mean_green')
+# ```
+

@@ -1,0 +1,96 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+# Create copy of spe for exploration
+spe_sub_copy <- spe_sub
+```
+
+### Exploring Zero-Cell and Single-Cell Spots
+```{r}
+# distribution of cells per spot
+tbl_cells_per_spot[1:13]
+
+# as proportions
+prop_cells_per_spot <- round(tbl_cells_per_spot / sum(tbl_cells_per_spot), 2)
+prop_cells_per_spot[1:13]
+```
+
+## Feature Selection: Identify Highly Variable Genes (HVGs)
+
+```{r}
+# remove mitochondrial genes
+spe_sub_copy <- spe_sub_copy[!is_mito,]
+dim(spe_sub_copy)
+
+library(scran)
+
+# fit mean-variance relationship
+dec <- modelGeneVar(spe_sub_copy)
+
+# visualize mean-variance relationship
+fit <- metadata(dec)
+plot(fit$mean, fit$var, 
+     xlab = "mean of log-expression", ylab = "variance of log-expression")
+curve(fit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+# select top HVGs
+top_hvgs <- getTopHVGs(dec, prop = 0.1)
+length(top_hvgs)
+```
+
+```{r}
+# compute PCA
+set.seed(123)
+spe_sub_copy <- runPCA(spe_sub_copy, subset_row = top_hvgs)
+# compute UMAP on top 50 PCs
+set.seed(123)
+spe_sub_copy <- runUMAP(spe_sub_copy, dimred = "PCA")
+# update column names
+colnames(reducedDim(spe_sub_copy, "UMAP")) <- paste0("UMAP", 1:2)
+
+# plot top 2 PCA dimensions
+plotDimRed(spe_sub_copy, type = "PCA")
+
+# plot top 2 UMAP dimensions
+plotDimRed(spe_sub_copy, type = "UMAP")
+```
+
+```{r}
+# graph-based clustering
+set.seed(123)
+k <- 12
+g <- buildSNNGraph(spe_sub_copy, k = k, use.dimred = "PCA")
+g_walk <- igraph::cluster_walktrap(g)
+```
+
+```{r}
+clus <- igraph::cut_at(g_walk, no = 6)
+table(clus)
+# store cluster labels in column 'label' in colData
+colLabels(spe) <- factor(clus)
+```
+
+```{r}
+# plot clusters in PCA reduced dimensions
+plotDimRed(spe_sub_copy,type = "PCA", 
+           annotate = "label", palette = "libd_layer_colors")
+
+# plot clusters in UMAP reduced dimensions
+plotDimRed(spe_sub_copy, type = "UMAP", 
+           annotate = "label", palette = "libd_layer_colors")
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
