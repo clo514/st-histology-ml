@@ -17,14 +17,12 @@ The most basic features used as inputs for the model were the RGB/Grayscale colo
 The baseline model performed binary classification for a select number of genes strongly correlated to the input features. Target classes were 0 (no gene expression at spot x) and 1 (positive gene expression at spot x). To perform binary classification, features were standardized and a logistic regression model performed prediction. 
 
 ## File Structure
-|
-|
-| _ Preprocessing.Rmd
-|     R Markdown notebook containing quality control operations to remove uninformative genes and spots.
-|
-| _ EDA.Rmd
-|     R Markdown notebook containing exploratory data analysis, including spot plots of genes and features of interest, various feature extraction 
-|     methods, and correlation analysis between features and genes
-|
-| _ Models.Rmd
-      R Markdown notebook performing binary classification of select genes found to be highly correlated with the input features.
+| <br />
+| _ Preprocessing.Rmd <br />
+|    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; R Markdown notebook containing quality control operations to remove uninformative genes and spots. <br />
+| <br />
+| _ EDA.Rmd <br />
+|     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; R Markdown notebook containing exploratory data analysis, including spot plots, feature extraction methods, and correlation analysis <br />
+| <br />
+| _ Models.Rmd <br />
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; R Markdown notebook performing binary classification of select genes found to be highly correlated with the input features. <br />
