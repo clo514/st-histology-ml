@@ -8,205 +8,263 @@ editor_options:
 ---
 
 # Preprocessing Data (Following OSTA Analysis Pipeline)
-In this markdown, analysis and quality control steps are performed following chapters 8 and 9 of the book 'Orchestrating Spatially-Resolved Transcriptomics Analysis with Bioconductor' <https://lmweber.org/OSTA-book/>. Data is fetched and plotted, then QC metrics are calculated and data is filtered based on QC thresholds for sample 151507 only. After QC operations, 33538 genes and 4136 spots remain in the sample.
 
-### Loading Libraries and Fetching Data
+In this markdown, analysis and quality control steps are performed following chapters 8 and 9 of the book 'Orchestrating Spatially-Resolved Transcriptomics Analysis with Bioconductor' <https://lmweber.org/OSTA-book/>. Data is fetched and plotted, then QC metrics are calculated and data is filtered based on QC thresholds for a single sample.
 
-Data is sourced from spatialLIBD (<http://spatial.libd.org/spatialLIBD/>), a project containing LIBD human dorsolateral pre-frontal cortex (DLPFC) spatial transcriptomics data from the 10x Genomics Visium Platform (<https://10xgenomics.com/products/spatial-gene-expression>). The data contains 12 lowres samples each with a scale factor of 0.0450045. For the purposes of this project, only sample 151507 is visualized and manipulated to start with, so the SpatialExperiment object is filtered to only include sample 151507. In sample 151507, 33538 genes and 4662 spots are captured, each with a unique barcode.
+### Overview of Data
 
-```{r, message=FALSE}
+Data is sourced from spatialLIBD (<http://spatial.libd.org/spatialLIBD/>), a project containing LIBD human dorsolateral pre-frontal cortex (DLPFC) spatial transcriptomics data from the 10x Genomics Visium Platform (<https://10xgenomics.com/products/spatial-gene-expression>). The data contains 12 lowres samples each with a scale factor of 0.0450045.
+
+### Importing Libraries
+
+```{r Import Libraries, message=FALSE}
 library(spatialLIBD)
 library(ggspavis)
 library(scater)
+library(ggplot2)
 ```
 
-```{r, message=FALSE}
-# fetch data: 33538 genes, 47681 spots
+### Helper Functions for QC
+
+The following functions are called by the driver code to perform plotting and QC operations.
+
+```{r Helper Functions for QC, message=FALSE}
+#' Plots a SpatialExperiment object by transforming the image into a rasterGrob object and calling ggplot
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @return None
+plot_image <- function(spe_sub) {
+  # get histology image
+  img <- SpatialExperiment::imgRaster(spe_sub)
+  
+  ## Transform to a rasterGrob object
+  grob <- grid::rasterGrob(img, width = grid::unit(1, "npc"), height = grid::unit(1, "npc"))
+  
+  # Create df for plotting
+  sample_df <- as.data.frame(colData(spe_sub), optional = TRUE)
+  
+  ## Make a plot using geom_spatial
+  p <- ggplot2::ggplot(
+      sample_df,
+      ggplot2::aes(
+          x = pxl_col_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
+          y = pxl_row_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
+      )
+  ) +
+      geom_spatial(
+          data = tibble::tibble(grob = list(grob)),
+          ggplot2::aes(grob = grob),
+          x = 0.5,
+          y = 0.5
+      )
+  
+  ## Show the plot
+  print(p)
+  p
+}
+
+#' Identifies mitochondrial genes, and adds per spot QC metrics including mitochondrial genes as a feature subset
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @return spe_sub Spatial Experiment object with added QC metrics
+add_QC_metrics <- function(spe_sub) {
+  # identify mitochondrial genes
+  is_mito <- grepl("(^MT-)|(^mt-)", rowData(spe_sub)$gene_name)
+  
+  # add per spot QC metrics, including mitochondrial genes as a feature subset
+  spe_sub <- addPerCellQC(spe_sub, subsets = list(mito = is_mito))
+  spe_sub
+}
+
+#' Sets a lower filtering threshold for library size, plots QC plot and spatial pattern of spots
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @param threshold lower limit on library size
+#' @return spe_sub Spatial Experiment object with added col data after lib size thresholding
+threshold_lib_size <- function(spe_sub, threshold) {
+  # continuous variable containing total number of genes at each spot
+  hist(colData(spe_sub)$sum, breaks = 20)
+  
+  # set filtering threshold for library size
+  print(plotQC(spe_sub, type = "scatter", 
+         metric_x = "cell_count", metric_y = "sum", 
+         threshold_y = threshold))
+  
+  # check number of spots below threshold
+  qc_lib_size <- colData(spe_sub)$sum < threshold
+  print(table(qc_lib_size))
+  
+  # look for spatial pattern in discarded spots
+  colData(spe_sub)$qc_lib_size <- qc_lib_size
+  
+  # plot spots
+  threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_lib_size,][,'array_row']
+  threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_lib_size,][,'array_col']
+  print(ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point() + ggtitle("Discarded Spots (Low Library Size)"))
+  
+  spe_sub
+}
+
+#' Sets a lower filtering threshold for number of expressed genes, plots QC plot and spatial pattern of spots
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @param threshold lower limit on number of expressed genes
+#' @return spe_sub Spatial Experiment object with added col data after expressed gene thresholding
+threshold_expressed_genes <- function(spe_sub, threshold) {
+  # continuous variable containing total number of genes at each spot
+  hist(colData(spe_sub)$detected, breaks = 20)
+  
+  # set filtering threshold for library size at 500
+  print(plotQC(spe_sub, type = "scatter", 
+         metric_x = "cell_count", metric_y = "detected", 
+         threshold_y = threshold))
+  
+  # check number of spots below threshold
+  qc_detected <- colData(spe_sub)$detected < threshold
+  print(table(qc_lib_size))
+  
+  # look for spatial pattern in discarded spots
+  colData(spe_sub)$qc_detected <- qc_detected
+  
+  # plot spots
+  threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_detected,][,'array_row']
+  threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_detected,][,'array_col']
+  print(ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point() + ggtitle("Discarded Spots (Low Expressed Genes)"))
+  
+  spe_sub
+}
+
+#' Sets an upper threshold on the proportion of mitochondrial reads
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @param threshold upper limit on proportional of mitochondrial reads
+#' @return spe_sub Spatial Experiment object with added col data after mitochondrial read thresholding
+threshold_mito_reads <- function(spe_sub, threshold) {
+  # histogram of mitochondrial read proportions
+  hist(colData(spe_sub)$subsets_mito_percent, breaks = 20)
+  
+  # plot mitochondrial read proportion vs. number of cells per spot
+  print(plotQC(spe_sub, type = "scatter", 
+         metric_x = "cell_count", metric_y = "subsets_mito_percent", 
+         threshold_y = threshold))
+  
+  # select QC threshold for mitochondrial read proportion
+  qc_mito <- colData(spe_sub)$subsets_mito_percent > threshold
+  print(table(qc_mito))
+  
+  # look for spatial pattern in discarded spots
+  colData(spe_sub)$qc_mito <- qc_mito
+  
+  # plot spots
+  threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_mito,][,'array_row']
+  threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_mito,][,'array_col']
+  print(ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point() + ggtitle("Discarded Spots (High Mitochondrial Reads)"))
+  
+  spe_sub
+}
+
+#' Sets an upper threshold on the number of cells per spot
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @param threshold upper limit on number of cells per spot
+#' @return spe_sub Spatial Experiment object with added col data after cell number thresholding
+threshold_num_cells <- function(spe_sub, threshold) {
+  # histogram of number of cells per spot
+  hist(colData(spe_sub)$cell_count, breaks = 20)
+  
+  # distribution of cells per spot
+  tbl_cells_per_spot <- table(colData(spe_sub)$cell_count)
+  
+  # plot number of expressed genes vs. number of cells per spot
+  print(plotQC(spe_sub, type = "scatter", 
+         metric_x = "cell_count", metric_y = "detected", 
+         threshold_x = threshold))
+  
+  # select QC threshold for number of cells per spot
+  qc_cell_count <- colData(spe_sub)$cell_count > threshold
+  print(table(qc_cell_count))
+  colData(spe_sub)$qc_cell_count <- qc_cell_count
+  
+  # plot spots
+  threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_cell_count,][,'array_row']
+  threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_cell_count,][,'array_col']
+  print(ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point())
+  
+  spe_sub
+}
+
+#' Discard spots based on previous QC metrics
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @return spe_sub Spatial Experiment object with low quality spots removed
+discard_spots <- function(spe_sub) {
+  # get discarded spots from each QC operation
+  qc_lib_size <- colData(spe_sub)$qc_lib_size
+  qc_detected <- colData(spe_sub)$qc_detected
+  qc_mito <- colData(spe_sub)$qc_mito
+  qc_cell_count <- colData(spe_sub)$qc_cell_count
+  
+  # number of discarded spots for each metric
+  apply(cbind(qc_lib_size, qc_detected, qc_mito, qc_cell_count), 2, sum)
+  
+  # combined set of discarded spots
+  discard <- qc_lib_size | qc_detected | qc_mito | qc_cell_count
+  print(table(discard))
+  
+  # store in object
+  colData(spe_sub)$discard <- discard
+  
+  # check spatial pattern of combined set of discarded spots
+  # plot spots
+  threshold_row <- colData(spe_sub)[colData(spe_sub)$discard,][,'array_row']
+  threshold_col <- colData(spe_sub)[colData(spe_sub)$discard,][,'array_col']
+  print(ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point())
+  
+  spe_sub <- spe_sub[, !colData(spe_sub)$discard]
+  print(dim(spe_sub))
+  spe_sub
+}
+
+#' Discard uninformative genes from the Spatial Experiment object
+#' @param spe_sub Spatial Experiment object filtered to only contain one sample
+#' @param var_threshold lower threshold for amount of variance willing to tolerate among the spots for a gene
+#' @return spe_sub Spatial Experiment object with uninformative genes removed
+discard_uninformative_genes <- function(spe_sub, var_threshold=1e-4) {
+  logcounts <- t(logcounts(spe_sub))
+  mito <- (rowData(spe_sub)$gene_name %in% rowData(spe_sub)$gene_name[is_mito])
+  zero_expression <- apply(logcounts, 2, function(x) length(unique(x)) == 1)
+  low_var <- apply(logcounts, 2, function(x) var(x) < 1e-4) 
+  discard <- zero_expression | low_var | mito
+  spe_sub <- spe_sub[!discard,]
+  spe_sub
+}
+```
+
+### Driver Code
+
+In the following block, data is first fetched from SpatialLIBD and filtered to only include a single sample. Then, the sample is plotted and QC metrics are added to the SpatialExperiment object.
+
+Then, the following four QC operations are performed to get rid of low quality spots. Note that all spots are already over tissue.
+
+1.  Set a lower threshold over library size. We want to remove spots with a low number of UMIs counts per spot.
+2.  Set a lower threshold on the number of expressed features (i.e. genes) per spot.
+3.  Set an upper threshold on the mumber of mitochondrial reads per spot. A high proportion of mitochondrial reads can indicate cell damage.
+4.  Set an upper threshold on the number of cells per spot. Spots with high cell counts have a low number of expressed genes, meaning that experiments failed.
+
+After performing QC operations, low quality spots are removed from the SpatialExperiment object.
+
+```{r QC, message=FALSE}
+# Fetch data from SpatialLIBD
 spe <- fetch_data(type='spe')
 
-# filter to 4226 spots pertaining to sample 151507
-sample_id <- unique(spe$sample_id)[1]
+# Filter spatial experiment object to only include sample ID
+sample_id <- "151673"
 spe_sub <- spe[, spe$sample_id == sample_id]
 
-# data frame of 4226 rows holding colData
-sample_df <- as.data.frame(colData(spe_sub), optional = TRUE)
-```
+# Plot image and add QC metrics to spe object
+img <- plot_image(spe_sub)
+spe_sub <- add_QC_metrics(spe_sub)
 
-### Plot Image of Sample
+# Perform QC operations
+spe_sub <- threshold_lib_size(spe_sub, 800)
+spe_sub <- threshold_expressed_genes(spe_sub, 550)
+spe_sub <- threshold_mito_reads(spe_sub, 28)
+spe_sub <- threshold_num_cells(spe_sub, 18)
 
-Sample 151507 is visualized by transforming the image into a rasterGrob object and calling ggplot.
-
-```{r, message=FALSE}
-# get histology image
-img <- SpatialExperiment::imgRaster(spe_sub)
-
-## Transform to a rasterGrob object
-grob <- grid::rasterGrob(img, width = grid::unit(1, "npc"), height = grid::unit(1, "npc"))
-
-## Make a plot using geom_spatial
-p <- ggplot2::ggplot(
-    sample_df,
-    ggplot2::aes(
-        x = pxl_col_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
-        y = pxl_row_in_fullres * SpatialExperiment::scaleFactors(spe_sub),
-    )
-) +
-    geom_spatial(
-        data = tibble::tibble(grob = list(grob)),
-        ggplot2::aes(grob = grob),
-        x = 0.5,
-        y = 0.5
-    )
-
-## Show the plot
-print(p)
-```
-
-## Quality Control
-
-We can identify LQ spots by:\
-1. Library size 2. Number of expressed genes 3. Proportion of mitochondrial reads\
-4. Number of cells per spot
-
-Note: all spots are already over tissue.
-
-### Identify mitochrondrial genes and add per spot QC metrics
-
-```{r, message=FALSE}
-# identify mitochondrial genes
-is_mito <- grepl("(^MT-)|(^mt-)", rowData(spe_sub)$gene_name)
-
-# add per spot QC metrics, including mitochondrial genes as a feature subset
-spe_sub <- addPerCellQC(spe_sub, subsets = list(mito = is_mito))
-```
-
-### Set a lower threshold on library size
-
-Library size = sum of UMI (unique molecular identifier) counts per spot, remove low library size
-
-```{r, message=FALSE}
-# continuous variable containing total number of genes at each spot
-hist(colData(spe_sub)$sum, breaks = 20)
-
-# set filtering threshold for library size at 400
-plotQC(spe_sub, type = "scatter", 
-       metric_x = "cell_count", metric_y = "sum", 
-       threshold_y = 600)
-
-# check number of spots below threshold
-qc_lib_size <- colData(spe_sub)$sum < 600
-table(qc_lib_size)
-
-# look for spatial pattern in discarded spots
-colData(spe_sub)$qc_lib_size <- qc_lib_size
-
-# plot spots
-threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_lib_size,][,'array_row']
-threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_lib_size,][,'array_col']
-ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point()
-```
-
-### Set a lower threshold on number of expressed features
-
-Discard spots with a low number of expressed genes per spot
-
-```{r, message=FALSE}
-# continuous variable containing total number of genes at each spot
-hist(colData(spe_sub)$detected, breaks = 20)
-
-# set filtering threshold for library size at 500
-plotQC(spe_sub, type = "scatter", 
-       metric_x = "cell_count", metric_y = "detected", 
-       threshold_y = 400)
-
-# check number of spots below threshold
-qc_detected <- colData(spe_sub)$detected < 400
-table(qc_lib_size)
-
-# look for spatial pattern in discarded spots
-colData(spe_sub)$qc_detected <- qc_detected
-
-# plot spots
-threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_detected,][,'array_row']
-threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_detected,][,'array_col']
-ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point()
-```
-
-### Set upper threshold on the proportion of mitochondrial reads
-
-A high proportion of mitochondrial reads can indicate cell damage
-
-```{r, message=FALSE}
-# histogram of mitochondrial read proportions
-hist(colData(spe_sub)$subsets_mito_percent, breaks = 20)
-
-# plot mitochondrial read proportion vs. number of cells per spot
-plotQC(spe_sub, type = "scatter", 
-       metric_x = "cell_count", metric_y = "subsets_mito_percent", 
-       threshold_y = 28)
-
-# select QC threshold for mitochondrial read proportion
-qc_mito <- colData(spe_sub)$subsets_mito_percent > 28
-table(qc_mito)
-
-# look for spatial pattern in discarded spots
-colData(spe_sub)$qc_mito <- qc_mito
-
-# plot spots
-threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_mito,][,'array_row']
-threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_mito,][,'array_col']
-ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point()
-```
-
-### Remove outlier spots for the number of cells per spot
-
-Spots with high cell counts have low numbers of expressed genes (i.e. experiments failed)
-
-```{r, message=FALSE}
-# histogram of number of cells per spot
-hist(colData(spe_sub)$cell_count, breaks = 20)
-
-# distribution of cells per spot
-tbl_cells_per_spot <- table(colData(spe_sub)$cell_count)
-
-# plot number of expressed genes vs. number of cells per spot
-plotQC(spe_sub, type = "scatter", 
-       metric_x = "cell_count", metric_y = "detected", 
-       threshold_x = 12)
-
-# select QC threshold for number of cells per spot
-qc_cell_count <- colData(spe_sub)$cell_count > 12
-table(qc_cell_count)
-colData(spe_sub)$qc_cell_count <- qc_cell_count
-
-# plot spots
-threshold_row <- colData(spe_sub)[colData(spe_sub)$qc_cell_count,][,'array_row']
-threshold_col <- colData(spe_sub)[colData(spe_sub)$qc_cell_count,][,'array_col']
-ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point()
-```
-
-## Remove Low-Quality Spots aggregated from the previous QC operations
-
-```{r, message=FALSE}
-# number of discarded spots for each metric
-apply(cbind(qc_lib_size, qc_detected, qc_mito, qc_cell_count), 2, sum)
-
-# combined set of discarded spots
-discard <- qc_lib_size | qc_detected | qc_mito | qc_cell_count
-table(discard)
-
-# store in object
-colData(spe_sub)$discard <- discard
-
-# check spatial pattern of combined set of discarded spots
-# plot spots
-threshold_row <- colData(spe_sub)[colData(spe_sub)$discard,][,'array_row']
-threshold_col <- colData(spe_sub)[colData(spe_sub)$discard,][,'array_col']
-ggplot(data.frame(threshold_row, threshold_col), aes(x=threshold_row, y=threshold_col)) + geom_point()
-```
-
-```{r, message=FALSE}
-# remove combined set of low-quality spots
-spe_sub <- spe_sub[, !colData(spe_sub)$discard]
-dim(spe_sub)
+# Discard low quality spots determined by QC operations
+spe_sub <- discard_spots(spe_sub)
+spe_sub <- discard_uninformative_genes(spe_sub)
 ```
