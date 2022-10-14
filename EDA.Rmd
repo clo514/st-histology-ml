@@ -1,27 +1,52 @@
 ---
 title: "R Notebook"
 output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
 ---
-# Exploratory Data Analysis
-In this markdown, exploratory data analysis is performed on sample 151507, with the goal of discovering genes whose expression values are correlated with simple histology image features (RGB/Grayscale color space). Sample 151507 includes 4136 spots and 21131 genes after performing QC on spots and removing genes with an expression level of 0 for all spots. 
 
-First, RGB/grayscale color channels are extracted from the image. All images are in lowres, meaning that they each have size 600 x 600. Then, the 4136 x 9 dataframe 'data' is created. Each row of data represents a barcode/spot, and the following column data is represented: <br />
+# Exploratory Data Analysis and Feature Extraction
 
-"pxl_col_in_fullres": column number of barcode in fullres image <br />
-"pxl_row_in_fullres": row number of barcode in fullres image <br />
-"barcode": string containing barcode <br />
-"scaled_pxl_col_in_lowres": column number of barcode in lowres image <br />
-"scaled_pxl_row_in_lowres": row number of barcode in lowres image <br />
-"red": red channel value of barcode <br />
-"green": green channel value of barcode <br />
-"blue": blue channel value of barcode <br />
-"grey": grey channel value of barcode <br />
+In this markdown, exploratory data analysis is performed on sample
+151507, with the goal of discovering genes whose expression values are
+correlated with simple histology image features (RGB/Grayscale color
+space). Sample 151507 includes 4136 spots and 21131 genes after
+performing QC on spots and removing genes with an expression level of 0
+for all spots.
 
-Then, correlation + the removal of outliers is performed in two ways, with the second being optimal.
-1. Correlation between gene expression values and RGB/Grayscale pixel values is performed; then, outlier pixel and gene expression values are removed.
-2. Outliers are removed first, then correlation is performed.
-### Imports
-```{r, message=FALSE}
+First, RGB/grayscale color channels are extracted from the image. All
+images are in lowres, meaning that they each have size 600 x 600. Then,
+the 4136 x 9 dataframe 'data' is created. Each row of data represents a
+barcode/spot, and the following column data is represented:
+
+"pxl_col_in_fullres": column number of barcode in fullres image
+
+"pxl_row_in_fullres": row number of barcode in fullres image
+
+"barcode": string containing barcode
+
+"scaled_pxl_col_in_lowres": column number of barcode in lowres image
+
+"scaled_pxl_row_in_lowres": row number of barcode in lowres image
+
+"red": red channel value of barcode
+
+"green": green channel value of barcode
+
+"blue": blue channel value of barcode
+
+"grey": grey channel value of barcode
+
+Then, correlation + the removal of outliers is performed in two ways,
+with the second being optimal. 1. Correlation between gene expression
+values and RGB/Grayscale pixel values is performed; then, outlier pixel
+and gene expression values are removed. 2. Outliers are removed first,
+then correlation is performed.
+
+## Imports
+
+```{r Import, message=FALSE}
 library(spatialLIBD)
 library(scuttle)
 library(dplyr)
@@ -31,32 +56,374 @@ library(EBImage)
 library(ggpubr)
 library(foreach)
 library(doParallel)
+library(plotwidgets)
+library(Dict)
+library(lme4)
 registerDoParallel(4)
+library(reticulate)
+
+py_install("tensorflow")
+py_install("keras")
+
+layers <- import("tensorflow.keras.layers")
+models <- import("tensorflow.keras.models")
+optimizers <- import("tensorflow.keras.optimizers")
 ```
 
+## Finding Features of Interest From Color Spaces
 
-### Remove Genes that have gene expression of 0 across all spots
-```{r, message=FALSE}
-# create boolean array for logcounts
-logcounts_151507 <- logcounts(spe_sub)
+The first features we want to extract from the sample are from the
+RGBGrayscale + HSL color spaces. We can first scale the pxl values in
+the SpatialExperiment object to fit the lowres image, and then determine
+the feature values for each pixel and add them to the SpatialExperiment
+object.
 
-# transpose logcounts matrix
-logcounts_151507 <- t(logcounts_151507)
+```{r Helper}
+### Helper Functions for Finding Features of Interest
 
-# remove genes that have a max gene expression of 0 across all spots
-zv <- apply(logcounts_151507, 2, function(x) length(unique(x)) == 1)
-logcounts_151507_filtered <- as.matrix(logcounts_151507[,!zv])
+get_img <- function(sample_id) {
+  png_link <- paste('https://spatial-dlpfc.s3.us-east-2.amazonaws.com/images/',sample_id,'_tissue_lowres_image.png',sep='')
+  img <- readImage(png_link)
+  img
+}
 
-# after filtering, 12407 genes are removed and 21131 are left over
-dim(logcounts_151507)
-dim(logcounts_151507_filtered)
+get_rgbg <- function(img) {
+  # create 600x600 color channel matrices for each channel
+  red <- imageData(EBImage::channel(img, 'red'))
+  green <- imageData(EBImage::channel(img, 'green'))
+  blue <- imageData(EBImage::channel(img, 'blue'))
+  grey <- imageData(EBImage::channel(img, 'grey'))
+  list('red'=red, 'green'=green, 'blue'=blue, 'grey'=grey)
+}
+
+visualize_color_channels <- function(rgbg) {
+  hist(rgbg$red)
+  hist(rgbg$green)
+  hist(rgbg$blue)
+  hist(rgbg$grey)
+}
+
+get_hsl <- function(rgbg) {
+  rgb_mat <- t(data.frame(c(rgbg$red), c(rgbg$green), c(rgbg$blue)))
+  hsl_mat <- rgb2hsl(rgb_mat)
+  
+  # HSL color space
+  hue <- matrix(hsl_mat[1,], nrow=600, ncol=600)
+  saturation <- matrix(hsl_mat[2,], nrow=600, ncol=600)
+  lightness <- matrix(hsl_mat[3,], nrow=600, ncol=600)
+  
+  list("hue"=hue, "saturation"=saturation, "lightness"=lightness)
+}
+
+add_scaled_pxls_lowres <- function(spe_sub) {
+  scaling <- SpatialExperiment::scaleFactors(spe_sub)
+  pxl_col_in_lowres <-round(spatialCoords(spe_sub)[,'pxl_col_in_fullres'] * scaling)
+  pxl_row_in_lowres <-round(spatialCoords(spe_sub)[,'pxl_row_in_fullres'] * scaling)
+  spatialCoords(spe_sub) <- cbind(spatialCoords(spe_sub), pxl_col_in_lowres, pxl_row_in_lowres)
+  spe_sub
+}
+
+match_all_color_spaces <- function(color, pxl_indices) {
+  apply(pxl_indices, MARGIN=1, match_each_color_space, color=color)
+}
+
+match_each_color_space <- function(pxl_indices, color) {
+  color[pxl_indices[1], pxl_indices[2]]
+}
+
+add_color_features <- function(spe_sub, colors) {
+  pxl_indices <- spatialCoords(spe_sub)[,c('pxl_row_in_lowres','pxl_col_in_lowres')]
+  feature_df <- lapply(c(rgbg, hsl), match_all_color_spaces, pxl_indices=pxl_indices)
+  spatialCoords(spe_sub) <- cbind(spatialCoords(spe_sub), 
+                                feature_df$red,
+                                feature_df$green,
+                                feature_df$blue,
+                                feature_df$grey,
+                                feature_df$hue,
+                                feature_df$saturation,
+                                feature_df$lightness)
+  colnames(spatialCoords(spe_sub)) <- c('pxl_col_in_fullres',
+                                        'pxl_row_in_fullres',
+                                        'pxl_col_in_lowres',
+                                        'pxl_row_in_lowres',
+                                        'red', 'green', 'blue', 'grey', 
+                                        'hue', 'saturation', 'lightness')
+  spe_sub
+}
 ```
 
+```{r}
+# Get image and RGBG/HSL feature spaces
+img <- get_img("151673")
+rgbg <- get_rgbg(img)
+hsl <- get_hsl(rgbg)
 
-### Create RGB color channels and plot histograms of distribution
+# Add low resolution pixel values to SpatialExperiment object
+spe_sub <- add_scaled_pxls_lowres(spe_sub)
+
+# Match color space values to pixel row/column location, and add to SpatialExperiment object
+spe_sub <- add_color_features(spe_sub, c(rgbg, hsl))
+```
+
+## Finding Features of Interest From Autoencoder Latent Space
+
+Another approach to finding features of interest is by using an encoder
+model to capture the latent space between an encoder/decoder autoencoder
+model. Then, we can use these low-dimensional features to perform
+classification.
+
+To build this model, we first need to split out input image into image
+'patches' centered at each spot. The size of these patches was chosen to
+be 14x14 pixels. Then, for each spot, the corresponding image patch will
+be encoded into a feature vector.
+
+To simplify this process, a 'Spot' class has been created to store the
+current pixel values of the spot and features from the latent space.
+
+```{r}
+create_spot_instance <- function(rowname, img, spe_sub) {
+  coords = spatialCoords(spe_sub)[rowname,]
+  row = coords['pxl_row_in_lowres']
+  col = coords['pxl_col_in_lowres']
+  
+  patch = imageData(img[(row - 6): (row + 6), (col - 6): (col + 6),])
+  
+  new("Spot", 
+      sampleId=imgData(spe_sub)$sample_id, 
+      barcode=rowname,
+      imagePatch=patch,
+      spatialCoords=coords)
+}
+
+setClass("Spot", 
+         slots=list(sampleId="character", 
+                    barcode="character", 
+                    imagePatch="array", 
+                    spatialCoords="numeric", 
+                    latentSpace="array"))
+
+vec <- lapply(rownames(spatialCoords(spe_sub)), create_spot_instance, img=img, spe_sub=spe_sub)
+```
+
+```{r}
+encoder_input = layers$Input(shape=as.integer(507), name='encoder_input')
+encoder_dense_layer1 = layers$Dense(units=as.integer(300), name='encoder_dense_1')(encoder_input)
+encoder_activ_layer1 = layers$LeakyReLU(name="encoder_leakyrelu_1")(encoder_dense_layer1)
+encoder_dense_layer2 = layers$Dense(units=as.integer(2), name='encoder_dense_2')(encoder_activ_layer1)
+encoder_output = layers$LeakyReLU(name='encoder_leakyrelu_2')(encoder_dense_layer2)
+encoder = models$Model(encoder_input, encoder_output, name="encoder_model")
+
+decoder_input = layers$Input(shape=as.integer(2), name='decoder_input')
+decoder_dense_layer1 = layers$Dense(units=as.integer(300), name='decoder_dense_1')(decoder_input)
+decoder_activ_layer1 = layers$LeakyReLU(name="decoder_leakyrelu_1")(decoder_dense_layer1)
+decoder_dense_layer2 = layers$Dense(units=as.integer(507), name='decoder_dense_2')(decoder_activ_layer1)
+decoder_output = layers$LeakyReLU(name='decoder_leakyrelu_2')(decoder_dense_layer2)
+decoder = models$Model(decoder_input, decoder_output, name="decoder_model")
+
+ae_input = layers$Input(shape=as.integer(507), name="AE_input")
+ae_encoder_output = encoder(ae_input)
+ae_decoder_output = decoder(ae_encoder_output)
+```
+
+```{r}
+get_encoded_features <- function(spot) {
+  temp <- c(spot@imagePatch)
+  dim(temp) <- c(1, length(temp))
+  
+  ae = models$Model(ae_input, ae_decoder_output, name="AE")
+  ae$compile(loss="mse", optimizer=optimizers$Adam(learning_rate=0.0005))
+  ae$fit(temp, temp, epochs=as.integer(50), shuffle=TRUE, verbose=as.integer(0))
+  
+  encoding = encoder$predict(temp, verbose=as.integer(0))
+  spot@latentSpace <- encoding
+  spot
+}
+
+extract_encodings <- function(spot) {
+  c(spot@latentSpace, spot@spatialCoords)
+}
+
+extract_barcodes <- function(spot) {
+  spot@barcode
+}
+
+add_gene_col <- function(g_name, features, logcounts, spe_sub) {
+  if (!(g_name %in% colnames(features))) {
+    features[,ncol(features) + 1] <- data.frame(logcounts[,get_gene_id(g_name, spe_sub)])
+    colnames(features)[ncol(features)] <- g_name
+  }
+  features
+}
+
+temp_vec_1 <- lapply(vec[1:500], get_encoded_features)
+temp_vec_2 <- lapply(vec[501:1000], get_encoded_features)
+temp_vec_3 <- lapply(vec[1001:1500], get_encoded_features)
+temp_vec_4 <- lapply(vec[1501:2000], get_encoded_features)
+temp_vec_5 <- lapply(vec[2001:2500], get_encoded_features)
+temp_vec_6 <- lapply(vec[2501:3000], get_encoded_features)
+temp_vec_7 <- lapply(vec[3001:3590], get_encoded_features)
+
+vec <- c(temp_vec_1, temp_vec_2, temp_vec_3, temp_vec_4, temp_vec_5, temp_vec_6, temp_vec_7)
+features <- t(sapply(vec, extract_encodings))
+rownames(features) <- sapply(vec, extract_barcodes)
+colnames(features)[1:2] <- c('latent_space_1', 'latent_space_2')
+
+features <- add_gene_col('MOBP', features, logcounts, spe_sub)
+features <- add_gene_col('SNAP25', features, logcounts, spe_sub)
+features <- add_gene_col('PCP4', features, logcounts, spe_sub)
+```
+
+```{r}
+# plot MOBP, SNAP25, PCP4 in 2D feature space
+print(ggplot(features, aes(x=features[,'latent_space_1'], y = features[,'latent_space_2'])) + geom_point(aes(color=features[,'MOBP'])) + theme(aspect.ratio = 1) + scale_color_gradient(low='pink', high='purple') + ggtitle(paste("MOBP Expression Level in 2D Latent Space")))
+
+print(ggplot(features, aes(x=features[,'latent_space_1'], y = features[,'latent_space_2'])) + geom_point(aes(color=features[,'SNAP25'])) + theme(aspect.ratio = 1) + scale_color_gradient(low='pink', high='purple') + ggtitle(paste("SNAP25 Expression Level in 2D Latent Space")))
+
+print(ggplot(features, aes(x=features[,'latent_space_1'], y = features[,'latent_space_2'])) + geom_point(aes(color=features[,'PCP4'])) + theme(aspect.ratio = 1) + scale_color_gradient(low='pink', high='purple') + ggtitle(paste("PCP4 Expression Level in 2D Latent Space")))
+```
+
+```{r}
+# Plot two feature latent space
+features <- data.frame(features)
+# Spot Plots for Autoencoder Features
+print(ggplot(features, aes(x = features[,'pxl_row_in_lowres'], y=600 - features[,'pxl_col_in_lowres'])) + geom_point(aes(color=features[,'latent_space_1'])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",'latent_space_1')))
+
+print(ggplot(features, aes(x = features[,'pxl_row_in_lowres'], y=600 - features[,'pxl_col_in_lowres'])) + geom_point(aes(color=features[,'latent_space_2'])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",'latent_space_2')))
+```
+
+```{r}
+mat <- compute_corr_matrix(logcounts, features[,1:13])
+
+top_corr <- get_top_k_corr(mat, 10)
+
+plot_corr_matrix(data.frame(top_corr))
+```
+
+## Finding Genes of Interest
+
+An overall goal of this exploratory data analysis is to identify genes
+of interest so that we can build predictive models in the future. To
+accomplish this, a correlation matrix between spots and image features
+(color spaces) is created. Then, the genes exhibiting the highest
+correlation to image features are selected and plotted.
+
+```{r}
+get_gene_name <- function(x, spe_sub) {
+  rowData(spe_sub)[rowData(spe_sub)$gene_id == x,]$gene_name
+}
+
+get_gene_id <- function(x, spe_sub) {
+  rowData(spe_sub)[rowData(spe_sub)$gene_name == x ,]$gene_id
+}
+
+create_id_name_dict <- function(logcounts, spe_sub) {
+  id_to_name <- mclapply(colnames(logcounts), get_gene_name, spe_sub=spe_sub)
+  names(id_to_name) <- colnames(logcounts)
+  id_to_name
+}
+
+# compute correlation matrix in parallel
+compute_corr_matrix <- function(expression_arr, color_arr, round=4) {
+  foreach(i = 1:ncol(expression_arr),
+  .combine = rbind,
+  .packages = c('data.table', 'doParallel')) %dopar% {
+    colName <- colnames(expression_arr)[i]
+    df <- data.frame(round(cor(expression_arr[,i], color_arr, method = 'pearson', use="complete.obs"), round))
+    rownames(df) <- colName
+    df
+  }
+}
+
+get_top_k_corr <- function(mat, k) {
+  temp_ind <- c()
+  for (i in 1:ncol(mat)) {
+    temp_ind <- c(temp_ind, order(abs(mat[,i]), decreasing=T)[1:k])
+  }
+  top_corr_ind <- unique(temp_ind)
+  # temp_ind <- c(temp_ind, order(abs(as.numeric(unlist(mat))), decreasing=T)[1:k])
+  # temp_ind <- temp_ind %% 600
+  top_corr <- rename_gene_ids(data.frame(mat[top_corr_ind,]))
+  top_corr
+}
+
+# Replace gene IDs with gene names
+rename_gene_ids <- function(correlation_matrix) {
+  for (i in 1:nrow(correlation_matrix)) {
+    g_name <- rownames(correlation_matrix)[i]
+    rownames(correlation_matrix)[i] <- rowData(spe_sub[g_name])$gene_name
+  }
+  correlation_matrix
+}
+
+# Plot correlation matrix
+plot_corr_matrix <- function(correlation_matrix) {
+  ggcorrplot(correlation_matrix, sig.level=0.01, lab_size = 4.5, p.mat = NULL,
+           insig = c("pch", "blank"), pch = 1, pch.col = "black", pch.cex =1,
+           tl.cex = 7) +
+  theme(axis.text.x = element_text(margin=margin(-2,0,0,0)),
+        axis.text.y = element_text(margin=margin(0,-2,0,0)),
+        panel.grid.minor = element_line(size=7)) + 
+  geom_tile(fill="white") +
+  geom_tile(height=1, width=1)
+}
+
+get_gene_id <- function(g_name, spe) {
+  gene_id = rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+  gene_id
+}
+```
+
+```{r}
+gene_id <- get_gene_id('TERB1', spe_sub)
+mat[gene_id,]
+
+```
+
+```{r}
+logcounts <- t(logcounts(spe_sub))
+
+id_to_name <- create_id_name_dict(logcounts, spe_sub)
+
+mat <- compute_corr_matrix(logcounts, 
+                           spatialCoords(spe_sub)[,5:ncol(spatialCoords(spe_sub))])
+
+top_corr <- get_top_k_corr(mat, 20)
+
+plot_corr_matrix(data.frame(top_corr))
+```
+
+```{r}
+mat[get_gene_id('SNAP25', spe_sub),]
+top_corr
+```
+
+## Spot Plots of Features
+
+```{r}
+temp_df <- data.frame(spatialCoords(spe_sub))
+for (g_name in colnames(temp_df[,5:11])) {
+  # print(paste(" Number of expressed barcodes for ", g_name, ": ",sum(data[,g_name] > 0), "/", length(data[,g_name])))
+  print(ggplot(temp_df, aes(x = temp_df[,'pxl_row_in_lowres'], y=600 - temp_df[,'pxl_col_in_lowres'])) + geom_point(aes(color=temp_df[,g_name])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",g_name)))
+}
+```
+
+```{r}
+# Add genes
+```
+
+```{r}
+temp_df <- data.frame(spatialCoords(spe_sub))
+for (g_name in colnames(temp_df[,5:11])) {
+  # print(paste(" Number of expressed barcodes for ", g_name, ": ",sum(data[,g_name] > 0), "/", length(data[,g_name])))
+  print(ggplot(temp_df, aes(x = temp_df[,'pxl_row_in_lowres'], y=600 - temp_df[,'pxl_col_in_lowres'])) + geom_point(aes(color=temp_df[,g_name])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",g_name)))
+}
+```
+
+### Create RGB and HSL color channels and plot histograms of distribution
+
 ```{r, message=FALSE}
-png_link <- imgData(spe)[imgData(spe)$sample_id == sample_id,]$data[1]
-img <- readImage('https://spatial-dlpfc.s3.us-east-2.amazonaws.com/images/151507_tissue_lowres_image.png')
+png_link <- paste('https://spatial-dlpfc.s3.us-east-2.amazonaws.com/images/',sample_id,'_tissue_lowres_image.png',sep='')
+img <- readImage(png_link)
 
 # create 600x600 color channel matrices for each channel
 red <- imageData(EBImage::channel(img, 'red'))
@@ -70,13 +437,14 @@ hist(green)
 hist(blue)
 hist(grey)
 
-#display(red)
-#display(green)
-#display(blue)
-```
+rgb_mat <- t(data.frame(c(red), c(green), c(blue)))
+hsl_mat <- rgb2hsl(rgb_mat)
 
-### Create DF Holding Pixel Coordinates and Pixel Color Channel Values Per Spot
-```{r, message=FALSE}
+# HSL color space
+hue <- Matrix(hsl_mat[1,], nrow=600, ncol=600)
+saturation <- Matrix(hsl_mat[2,], nrow=600, ncol=600)
+lightness <- Matrix(hsl_mat[3,], nrow=600, ncol=600)
+
 # get scale factor
 scaling <- SpatialExperiment::scaleFactors(spe_sub)
 
@@ -102,15 +470,21 @@ X_r <- vector(mode="double", length = dim(data)[1])
 X_g <- vector(mode="double", length = dim(data)[1])
 X_b <- vector(mode="double", length = dim(data)[1])
 X_grey <- vector(mode="double", length = dim(data)[1])
+X_h <- vector(mode="double", length = dim(data)[1])
+X_s <- vector(mode="double", length = dim(data)[1])
+X_l <- vector(mode="double", length = dim(data)[1])
 
 # iterate over dataframe, add rgb values
 for (i in 1:nrow(data)) {
     col_index <- data[i,]$scaled_pxl_col_in_lowres
     row_index <- data[i,]$scaled_pxl_row_in_lowres
-    X_r[i] <- red[col_index, row_index]
-    X_g[i] <- green[col_index, row_index]
-    X_b[i] <- blue[col_index, row_index]
-    X_grey[i] <- grey[col_index, row_index]
+    X_r[i] <- red[row_index, col_index]
+    X_g[i] <- green[row_index, col_index]
+    X_b[i] <- blue[row_index, col_index]
+    X_grey[i] <- grey[row_index, col_index]
+    X_h[i] <- hue[row_index, col_index]
+    X_s[i] <- saturation[row_index, col_index]
+    X_l[i] <- lightness[row_index, col_index]
 }
 
 data[ , ncol(data) + 1] <- X_r
@@ -121,15 +495,16 @@ data[ , ncol(data) + 1] <- X_b
 colnames(data)[ncol(data)] <- "blue"
 data[ , ncol(data) + 1] <- X_grey
 colnames(data)[ncol(data)] <- "grey"
+data[ , ncol(data) + 1] <- X_h
+colnames(data)[ncol(data)] <- "hue"
+data[ , ncol(data) + 1] <- X_s
+colnames(data)[ncol(data)] <- "saturation"
+data[ , ncol(data) + 1] <- X_l
+colnames(data)[ncol(data)] <- "lightness"
 ```
-
-```{r, message=FALSE}
-dim(data)
-data
-```
-
 
 ### Functions for high res images, where there exist more than one pixel per spot
+
 ```{r, message=FALSE}
 # Mode Function
 getmode <- function(v) {
@@ -171,8 +546,12 @@ ind_barcodes
 ```
 
 ### Analysis 1: Compute Correlation First, Compute Outliers After
-In the following blocks, the correlation between all genes + pixel color channel values is calculated. Then, for the top performing genes, a plotting function is called in which spots corresponding to outlier gene expression values + spots corresponding to outlier pixel color channel values are removed.
 
+In the following blocks, the correlation between all genes + pixel color
+channel values is calculated. Then, for the top performing genes, a
+plotting function is called in which spots corresponding to outlier gene
+expression values + spots corresponding to outlier pixel color channel
+values are removed.
 
 ```{r, message=FALSE}
 # compute correlation matrix in parallel
@@ -233,7 +612,6 @@ correlation_matrix <- compute_corr_matrix(logcounts_151507_filtered, color_arr)
 correlation_matrix_filtered <- filter_corr_matrix(correlation_matrix, 0.3)
 plot_corr_matrix(correlation_matrix_filtered)
 ```
-
 
 ```{r, message=FALSE}
 # plot color channel value vs gene expression. If remove_outliers == TRUE, outlier gene expression values + outlier pixel color values are removed.
@@ -312,18 +690,25 @@ plot_all_channels('MT-ND1', logcounts_151507_filtered, color_arr, remove_outlier
 plot_all_channels('MT-CO2', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
 plot_all_channels('MT-CO2', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
 ```
+
 ```{r, message=FALSE}
 plot_all_channels('MT-ATP6', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
 plot_all_channels('MT-ATP6', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
 ```
+
 ```{r, message=FALSE}
 plot_all_channels('MT-CYB', logcounts_151507_filtered, color_arr, remove_outliers=FALSE)
 plot_all_channels('MT-CYB', logcounts_151507_filtered, color_arr, remove_outliers=TRUE)
 ```
 
-
 ## Redo Analysis Removing Outliers Before Correlation Computation
-In the following blocks, analysis is redone by removing outliers before correlation computation based on the isOutlier() function. If the number of non-NA expression values < num = 100, the gene is removed from consideration. Then, correlation between the RGB/Grayscale values and gene expression values is computed. 
+
+In the following blocks, analysis is redone by removing outliers before
+correlation computation based on the isOutlier() function. If the number
+of non-NA expression values \< num = 100, the gene is removed from
+consideration. Then, correlation between the RGB/Grayscale values and
+gene expression values is computed.
+
 ```{r, message=FALSE}
 # Remove outlier gene expression values. If median gene expression value is 0, replace complement of outliers with NA. Else replace outliers with NA. If remaining non-NA expression values < num, replace entire column with NA.
 remove_outliers <- function(arr, num) {
@@ -343,44 +728,141 @@ remove_outliers <- function(arr, num) {
 }
 
 get_top_k_corr <- function(mat, k) {
-  top_corr_ind <- unique(c(order(abs(mat[,1]),decreasing=T)[1:k], 
-                         order(abs(mat[,2]),decreasing=T)[1:k], 
-                         order(abs(mat[,3]),decreasing=T)[1:k], 
-                         order(abs(mat[,4]),decreasing=T)[1:k]))
-  top_corr <- rename_gene_ids(mat[top_corr_ind,])
+  temp_ind <- c()
+  for (i in 1:ncol(mat)) {
+    temp_ind <- c(temp_ind, order(abs(mat[,i]), decreasing=T)[1:k])
+  }
+  top_corr_ind <- unique(temp_ind)
+  top_corr <- rename_gene_ids(data.frame(mat[top_corr_ind,]))
   top_corr
 }
+
+get_gene_id <- function(g_name, spe) {
+  gene_id = rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+  gene_id
+}
+
+add_gene_col_data_df <- function(gene_id, g_name, data) {
+  if (!(g_name %in% colnames(data))) {
+    data[,ncol(data) + 1] <- data.frame(logcounts_151673_filtered[,gene_id])
+    colnames(data)[ncol(data)] <- g_name
+  }
+  data
+}
+
+drop_cols_data_df <- function(drop, data) {
+  data <- data[,!(names(data) %in% drop)]
+  data
+}
+
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+```
+
+```{r}
+g_name <- 'MOBP'
+gene_id <- get_gene_id(g_name, spe)
+data <- add_gene_col_data_df(gene_id, g_name, data)
+```
+
+```{r}
+#temp <- data.frame(spatialCoords(spe_sub), vec1)
+g_name='vec1'
+temp <- data.frame(spatialCoords(spe_sub), vec1)
+print(ggplot(temp, aes(x = temp[,'pxl_row_in_lowres'], y=600 - temp[,'pxl_col_in_lowres'])) + geom_point(aes(color=temp[,g_name])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",g_name)))
+```
+
+```{r}
+for (g_name in colnames(data[6:12])) {
+  print(ggplot(data, aes(x = data[,'scaled_pxl_row_in_lowres'], y=600 - data[,'scaled_pxl_col_in_lowres'])) + geom_point(aes(color=data[,g_name])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",g_name)))
+}
+```
+
+```{r}
+top_corr
+```
+
+```{r}
+mat <- compute_corr_matrix(logcounts_151673_filtered, data[6:12])
+top_corr <- get_top_k_corr(mat, 10)
+plot_corr_matrix(data.frame(top_corr))
+```
+
+```{r}
+for (g_name in rownames(top_corr)) {
+  gene_id <- get_gene_id(g_name, spe)
+  data <- add_gene_col_data_df(gene_id, g_name, data)
+}
+data
+```
+
+```{r}
+for (g_name in colnames(data[13:ncol(data)])) {
+  print(paste(" Number of expressed barcodes for ", g_name, ": ",sum(data[,g_name] > 0), "/", length(data[,g_name])))
+  print(ggplot(data, aes(x = data[,'scaled_pxl_row_in_lowres'], y=600 - data[,'scaled_pxl_col_in_lowres'])) + geom_point(aes(color=data[,g_name])) + theme(aspect.ratio = 1) + scale_color_gradient(low="pink", high="purple") + ggtitle(paste("Spot Plot ",g_name)))
+}
+```
+
+```{r}
+logcounts_151673[,i] > 0
+sum(logcounts_151673_filtered[,gene_id] > 0)
+sum(!is.na(logcounts_151673_filtered[,gene_id]))
+
+compute_corr_matrix(data.frame(logcounts_151673_filtered), data[,6:12])
+compute_corr_matrix(data.frame(logcounts_151673_filtered_no_outliers[,gene_id]), temp_data[,6:12])
+```
+
+```{r}
+g_name = 'SNAP25'
+gene_id = rowData(spe)[rowData(spe)$gene_name == 'SNAP25',]$gene_id
+print(sum(logcounts_151507[,gene_id] != 0))
+print(sum(logcounts_151507_filtered[,gene_id] != 0))
+print(sum(!is.na(logcounts_151507_filtered_no_outliers[,gene_id])))
+
+mat_with_outliers <- compute_corr_matrix(data.frame(logcounts_151507_filtered[,gene_id]), data[,4:5])
+mat_with_outliers
+
+mat_outliers <- compute_corr_matrix(data.frame(logcounts_151507_filtered_no_outliers[,gene_id]), data[,4:5])
+mat_outliers
 ```
 
 ```{r, message=FALSE}
 # Call remove outlier function
-logcounts_temp <- as.matrix(logcounts_151507_filtered)
+logcounts_temp <- as.matrix(logcounts_151673_filtered)
 col_names <- colnames(logcounts_temp)
-logcounts_151507_filtered_no_outliers <- remove_outliers(logcounts_temp, 100)
-colnames(logcounts_151507_filtered_no_outliers) <- col_names
+logcounts_151673_filtered_no_outliers <- remove_outliers(logcounts_temp, 100)
+colnames(logcounts_151673_filtered_no_outliers) <- col_names
 
 # Remove columns that are completely NA
 not_all_na <- function(x) any(!is.na(x))
-logcounts_151507_filtered_no_outliers <- data.frame(logcounts_151507_filtered_no_outliers) %>% select(where(not_all_na))
+logcounts_151673_filtered_no_outliers <- data.frame(logcounts_151673_filtered_no_outliers) %>% select(where(not_all_na))
 
 # compute correlation matrix
-mat <- compute_corr_matrix(logcounts_151507_filtered_no_outliers, color_arr)
+mat <- compute_corr_matrix(logcounts_151673_filtered_no_outliers, data[6:12])
 ```
-
 
 ```{r, message=FALSE}
 top_corr <- get_top_k_corr(mat, 10)
 plot_corr_matrix(top_corr)
 ```
 
+```{r}
+# MOBP, SNAP25, plot 
+# Linear regression model
+# Where do MOBP/SNAP25 fall in my analysis
+# When did it get removed, spot plots of these genes
+# spot plots of top genes in correlation analysis
+gene_id = rowData(spe)[rowData(spe)$gene_name == 'LFNG',]$gene_id
+sum(!is.na(logcounts_151507_filtered_no_outliers[,gene_id]))
+```
+
 ```{r, message=FALSE}
 plot_all_channels('LFNG', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
 ```
+
 ```{r, message=FALSE}
 plot_all_channels('ELK4', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
 ```
+
 ```{r, message=FALSE}
 plot_all_channels('PLIN4', logcounts_151507_filtered_no_outliers, color_arr, remove_outliers=FALSE)
 ```
-
-

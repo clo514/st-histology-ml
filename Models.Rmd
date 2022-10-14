@@ -1,0 +1,119 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+library(reticulate)
+library('caret')
+library(spatialLIBD)
+library(MLmetrics)
+
+py_install("pandas")
+py_install("numpy")
+py_install("scikit-learn")
+py_install("matplotlib")
+
+sk <- import("sklearn")
+pd <- import("pandas")
+np <- import("numpy")
+plt <- import("matplotlib")
+sk_model_selection <- import("sklearn.model_selection")
+sk_linear_model <- import("sklearn.linear_model")
+sk_preprocessing <- import("sklearn.preprocessing")
+pyplot <- import("matplotlib.pyplot")
+```
+
+## Logistic Regression Classification from RGBG/HSL Image Spaces
+```{r}
+y <- logcounts_151673_filtered
+sum(y[y > 0])
+y[!(y > 0)] <- 1
+```
+
+
+```{r}
+split_data <- function(spe, g_name, logcounts, color_arr, isBinary) {
+  gene_id <- rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+  y <- logcounts[,gene_id]
+  if (isBinary) {
+    y[y > 0] <- 1
+  }
+  x <- color_arr
+  
+  temp <- sk_model_selection$train_test_split(x, y, test_size=0.1)
+  x_train <- temp[1]
+  x_test <- temp[2]
+  y_train <- temp[3]
+  y_test <- temp[4]
+  list(x_train, x_test, y_train, y_test)
+}
+
+evaluate_model <- function(y_predict, y_true, g_name) {
+  precision <- Precision(y_true, y_predict)
+  f1 <- F1_Score(y_true, y_predict)
+  recall <- Recall(y_true, y_predict)
+  accuracy <- Accuracy(y_predict, y_true)
+  print(cat(paste(g_name, paste("Accuracy: ", accuracy), paste('Recall: ', recall), paste('Precision: ', precision), paste('F1: ', f1), sep="\n")))
+
+}
+
+train <- function(spe, g_name, logcounts, color_arr, isBinary) {
+  split_data <- split_data(spe, g_name, logcounts, color_arr, isBinary)
+
+  x_train <- split_data[1][[1]][[1]]
+  x_test <- split_data[2][[1]][[1]]
+  y_train <- split_data[3][[1]][[1]]
+  y_test <- np$ravel(split_data[4][[1]][[1]])
+  
+  scaler <- sk_preprocessing$StandardScaler()
+  features_standardized <- scaler$fit_transform(x_train)
+  test_standardized <- scaler$transform(x_test)
+  
+  # Logistic regression for binary classification
+  clf <- sk_linear_model$LogisticRegression(random_state=as.integer(100))
+  clf$fit(features_standardized, np$ravel(y_train))
+  y_predict <- clf$predict(test_standardized)
+  
+  # Metrics for binary classification
+  evaluate_model(y_predict, y_test, g_name)
+  
+  # Find the top 10 most entries most likely to be + gene expression value and observe their ground truth
+  y_predict_proba <- clf$predict_proba(test_standardized)
+  temp <- order(y_predict_proba[,2],decreasing=T)[1:10]
+  print(paste("Accuracy of top 10 barcodes likely to have positive gene expression: ", sum(y_test[temp] == 1) / 10))
+  cat('\n')
+}
+```
+
+```{r}
+g_name <- "MOBP"
+logcounts <- logcounts_151673_filtered
+gene_id <- rowData(spe)[rowData(spe)$gene_name == g_name,]$gene_id
+y <- logcounts[,gene_id]
+#y[y > 0] <- 1
+x <- data.frame(data[10], data[11])
+scaler <- sk_preprocessing$StandardScaler()
+features_standardized <- scaler$fit_transform(x)
+test_standardized <- scaler$transform(x)
+temp_df <- data.frame(test_standardized,y)
+ggplot(temp_df, aes(x = temp_df[,'X1'], y=temp_df[,'X2'])) + geom_point(aes(color=temp_df[,'y'])) + theme(aspect.ratio = 1) + ggtitle(paste("Green and Saturation Features For ",g_name))
+```
+
+```{r}
+# Get list of genes with strongest correlations
+top_genes <- rownames(top_corr)
+
+for (g_name in c("MOBP", "CD74")) {
+  train(spe, g_name, logcounts_151673_filtered, data.frame(data[7], data[11]), TRUE)
+}
+```
+```{r}
+
+```
+
+
